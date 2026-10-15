@@ -5,9 +5,29 @@ import vm from 'node:vm'
 const source = readFileSync(new URL('./plugin.js', import.meta.url), 'utf8')
 const version = readFileSync(new URL('./VERSION', import.meta.url), 'utf8').trim()
 assert.match(version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/, 'VERSION must be valid SemVer')
+
+// ── synthetic agent.log ────────────────────────────────────────────────────
+// One orphaned bg-review spawn 5h ago (no terminal line) → chip must say STALE.
+// One completed compaction 3d ago → chip must say "compact idle · last 3d …".
+const HOUR = 3600 * 1000
+const DAY = 24 * HOUR
+const pad = (n, w = 2) => String(n).padStart(w, '0')
+const logTs = msOffsetAgo => {
+  const d = new Date(Date.now() - msOffsetAgo)
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())},042`
+}
+const SPAWN_LINE = `${logTs(5 * HOUR)} INFO run_agent: OpenAI client created (agent_init, shared=True) thread=bg-review:33108 provider=custom base_url=http://127.0.0.1:8080/v1 model=Qwen38-27b-q8`
+const COMP_DONE_LINE = `${logTs(3 * DAY)} INFO agent.conversation_compression: context compression done: session=test_sess messages=120->45 rough_tokens=~55000 awaiting_real_usage=true`
+const COMP_TEL_LINE = `${logTs(3 * DAY + 500)} INFO agent.conversation_compression: context compression attempt telemetry: {"commit_status":"committed","failure_class":null,"total_duration_ms":241000}`
+
 const eventHandlers = new Map()
 const host = {
-  logs: async () => ({ lines: [] }),
+  logs: async ({ search }) => ({
+    lines:
+      search === 'bg-review' ? [SPAWN_LINE]
+      : search === 'context compression' ? [COMP_DONE_LINE, COMP_TEL_LINE]
+      : [] // 'Turn ended', 'Micro-compaction', ticker — quiet
+  }),
   onEvent(type, handler) {
     eventHandlers.set(type, handler)
     return () => eventHandlers.delete(type)
@@ -26,7 +46,7 @@ const modules = new Map([
   ['@hermes/plugin-sdk', synthetic({
     host,
     STATUSBAR_AREAS: { right: 'statusBar.right' },
-    Tip: function Tip() {},
+    Tip: function Tip(props) { return { type: 'Tip', props } }, // pass-through so labels/children stay walkable
   })],
   ['react/jsx-runtime', synthetic({
     jsx: (type, props) => ({ type, props }),
@@ -51,6 +71,7 @@ const plugin = pluginModule.namespace.default
 assert.equal(plugin.id, 'bg-review-watch')
 assert.equal(plugin.defaultEnabled, true)
 
+// ctx without storage (engine must guard — mirrors the sandbox when storage is absent).
 const contributions = []
 let dispose = () => {}
 plugin.register({
@@ -62,6 +83,47 @@ assert.deepEqual(contributions.map(item => item.id), ['chip', 'chip-compact', 'c
 assert.ok(eventHandlers.has('message.start'))
 assert.ok(eventHandlers.has('message.complete'))
 assert.ok(eventHandlers.has('review.summary'))
+
+// let the initial reconcile() / reconcileCompaction() promises settle
+await new Promise(resolve => setTimeout(resolve, 100))
+
+// walk a fake-jsx tree and collect every string child — labels + tooltips land here
+function collectText(node, out = []) {
+  if (node == null || typeof node === 'boolean') return out
+  if (typeof node === 'string' || typeof node === 'number') { out.push(String(node)); return out }
+  if (Array.isArray(node)) { node.forEach(child => collectText(child, out)); return out }
+  if (node.props) {
+    for (const value of Object.values(node.props)) collectText(value, out)
+  }
+  return out
+}
+
+// The contribution's render() returns a JSX element {type, props}; the fake runtime
+// never invokes it, so call the one function level ourselves (Chip/CompactionChip/GuardChip).
+function renderedText(item) {
+  const el = item.render()
+  let node = el
+  while (node && typeof node.type === 'function') node = node.type(node.props)
+  return collectText(node).join(' | ')
+}
+
+const chip = contributions.find(item => item.id === 'chip')
+const compactChip = contributions.find(item => item.id === 'chip-compact')
+
+// 1. orphaned spawn older than STALE_REVIEW_MS → "review stale", NOT "review running"
+let text = renderedText(chip)
+assert.ok(text.includes('review stale'), `expected stale label, got: ${text}`)
+assert.ok(!text.includes('review running'), `stale chip must not claim the slot: ${text}`)
+
+// 2. a review.summary event clears the stale state → "review done"
+eventHandlers.get('review.summary')({ text: 'Background review complete result=none' })
+await new Promise(resolve => setTimeout(resolve, 20))
+text = renderedText(chip)
+assert.ok(text.includes('review done'), `expected review done after summary event, got: ${text}`)
+
+// 3. compaction chip is ALWAYS rendered (no null branch) and shows the last completion age
+const compactText = renderedText(compactChip)
+assert.ok(compactText.includes('compact idle · last 3d'), `expected persisted last-compaction label, got: ${compactText}`)
 
 dispose()
 assert.equal(eventHandlers.size, 0)

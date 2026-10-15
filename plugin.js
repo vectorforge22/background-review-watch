@@ -8,9 +8,15 @@
 //     idle    → "review idle"   + fill bar: turns since last review / nudge interval
 //     running → "review running · 2m 14s" (pulsing dot, accent color)
 //     just done → "review done 3s ago" + the summary text in the tooltip
-//   compaction chip (only while compacting or within 10 min of a finish):
+//     stale   → "review stale · 16h 10m (no end line)" (warning dot) — a spawn marker
+//               with no terminal line older than STALE_REVIEW_MS. The review process died
+//               without logging (gateway reboot/kill/OOM); nothing is running, slot is free.
+//   compaction chip (always):
 //     running → "compacting · 4m 12s" (pulsing dot, accent color)
 //     just done → "compact done 3m ago" / "compact failed 2m ago" (reduction or failure in tooltip)
+//     idle    → "compact idle · last 5d 2h" + the last committed reduction or failure class
+//               in the tooltip. The last terminal state is persisted via ctx.storage so it
+//               survives log-window rotation, hot reloads, and app restarts.
 //
 // Data sources (all read-only, no Python backend, no gateway restart):
 //   - host.onEvent('review.summary')        → live review completion + summary text
@@ -25,6 +31,11 @@
 // Detection model: at most one background review runs at a time (a new turn supersedes an
 // in-flight one, and superseded runs still log a `complete` line). So:
 //   review running  <=>  latest "thread=bg-review:<pid>" start ts  >  latest complete/failed ts
+// Resilience: that equality assumes every spawn eventually logs a terminal line. It does not —
+// the review is a THREAD inside the gateway process (thread ident, not pid), and a reboot or
+// kill mid-review dies with no log at all (observed 2026-10-14: spawn 19:34, PC reboot 19:47,
+// no terminal line ever; chip pinned "running" for 16h+). A spawn older than STALE_REVIEW_MS
+// with no terminal line is therefore reported as `stale` (diagnostic), not `running`.
 //
 // Compaction runs one at a time too (the compressor serializes attempts on the session).
 // A batch attempt logs `context compression started:` at attempt start and exactly one
@@ -49,6 +60,11 @@ const POLL_MS = 20000 // log poll cadence (idle cost is a few tiny server-side-f
 const RECENT_DONE_MS = 600000 // keep the "done Xs ago" label for 10 min, then plain idle
 const RECENT_COMP_MS = 600000 // keep the compaction chip 10 min after a finish
 const RECENT_GUARD_MS = 600000 // keep completion-boundary diagnostics visible for 10 min
+// Orphan-spawn ceiling. Verified local-model review runs on this box: 22 min and
+// 26 min (agent.log, 10-14 pairs); 4h leaves wide headroom over anything healthy.
+// Above it, "running" can only mean the process died without logging — report stale, not running.
+const STALE_REVIEW_MS = 4 * 60 * 60 * 1000
+const COMPACT_LAST_KEY = 'bg-review-watch.compact-last.v1' // ctx.storage key for the last terminal compaction
 
 const RE_START = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*OpenAI client created.*thread=bg-review:(\d+)/
 const RE_DONE = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*(Background review complete|Background memory\/skill review failed)(?:.*result=(\w+))?/
@@ -78,7 +94,9 @@ function ago(ms) {
   if (s < 60) return `${s}s`
   const m = Math.floor(s / 60)
   if (m < 60) return `${m}m ${s % 60}s`
-  return `${Math.floor(m / 60)}h ${m % 60}m`
+  const h = Math.floor(m / 60)
+  if (h < 48) return `${h}h ${m % 60}m`
+  return `${Math.floor(h / 24)}d ${h % 24}h`
 }
 function fmtTokens(n) {
   if (n == null) return '?'
@@ -88,7 +106,7 @@ function fmtTokens(n) {
 
 // ── plugin-global state (shared by the chips; module-scoped = survives chip re-mounts) ──
 let state = {
-  mode: 'idle', // 'idle' | 'running'
+  mode: 'idle', // 'idle' | 'running' | 'stale' (orphaned spawn marker, slot free)
   startedAt: null,
   doneAt: null,
   doneResult: null,
@@ -115,6 +133,7 @@ let state = {
     lastMicroAt: null,
     microDetail: null,
     lastPoll: 0,
+    lastRec: null, // { v, endedAt, committed, failure, doneFrom, doneTo } — persisted via ctx.storage
   },
 }
 let subs = new Set()
@@ -125,6 +144,22 @@ function set(patch) {
 function setCompact(patch) {
   state = { ...state, compact: { ...state.compact, ...patch } }
   subs.forEach((f) => f())
+}
+
+// ctx of the current plugin registration (for storage); null under the smoke test.
+let engineCtx = null
+
+async function hydrateLastCompact() {
+  if (!engineCtx || !engineCtx.storage) return
+  try {
+    const rec = await engineCtx.storage.get(COMPACT_LAST_KEY)
+    if (rec && rec.v === 1 && typeof rec.endedAt === 'number') setCompact({ lastRec: rec })
+  } catch { /* storage blip — "compact idle" stands until a fresh terminal line lands */ }
+}
+
+function persistLastCompact(rec) {
+  if (!engineCtx || !engineCtx.storage) return
+  engineCtx.storage.set(COMPACT_LAST_KEY, rec).catch(() => {})
 }
 
 function collectReviewMarkers(lines) {
@@ -231,16 +266,20 @@ async function reconcile() {
       }).length
     }
 
-    const running = start != null && (done == null || start > done)
+    // `live` = the log evidence says a review is in flight; `stale` = that claim is old
+    // enough that only process death explains it (no terminal line survives a reboot/kill).
+    const live = start != null && (done == null || start > done)
+    const stale = live && now - start > STALE_REVIEW_MS
     const overlap = start != null && state.foregroundStartedAt != null &&
       start >= state.foregroundStartedAt &&
       (state.foregroundCompletedAt == null || start < state.foregroundCompletedAt)
     set({
-      mode: running ? 'running' : 'idle',
-      startedAt: running ? (state.startedAt || start) : null,
+      mode: stale ? 'stale' : live ? 'running' : 'idle',
+      startedAt: live ? (state.startedAt || start) : null,
       doneAt: done,
       doneResult: done != null && result != null ? result : state.doneResult,
-      turnsSince: running ? 0 : turns,
+      // Only a genuinely running review holds the slot; stale/idle report the real countdown.
+      turnsSince: live && !stale ? 0 : turns,
       reviewOverlapAt: overlap ? start : state.reviewOverlapAt,
     })
   } catch {
@@ -291,6 +330,14 @@ async function reconcileCompaction() {
       else committed = true // only a `done` line (committed path) was in the window
     }
 
+    // Persist the newest terminal state so "last compacted" survives the 3000-line log
+    // window rolling past, hot reloads (fresh module), and app restarts.
+    let lastRec = state.compact.lastRec
+    if (end != null && (!lastRec || end > (lastRec.endedAt || 0))) {
+      lastRec = { v: 1, endedAt: end, committed, failure, doneFrom, doneTo }
+      persistLastCompact(lastRec)
+    }
+
     const mc = await host.logs({ file: 'agent', lines: 500, search: 'Micro-compaction' })
     const mlines = (mc && (mc.lines || mc.data || mc.logs)) || []
     const micro = collectMicroMarkers(mlines)
@@ -306,6 +353,7 @@ async function reconcileCompaction() {
       doneTo,
       lastMicroAt: micro.at,
       microDetail: micro.detail,
+      lastRec,
     })
   } catch {
     /* fail-open: keep last state on a REST blip */
@@ -462,6 +510,11 @@ function Chip() {
     textColor = 'var(--ui-accent)'
     label = `review running · ${ago(now - s.startedAt)}`
     detail = 'Background self-improvement review is in progress. It replays the recent conversation on the local model and may update memory/skills. The bar shows the nudge countdown for the next run.'
+  } else if (s.mode === 'stale') {
+    dotColor = 'var(--ui-warning, #d97706)'
+    textColor = dotColor
+    label = `review stale · ${ago(now - s.startedAt)}`
+    detail = 'A background review spawned but never logged a completion line — the gateway process most likely rebooted or was killed mid-review, so no inference is actually running and the local-model slot is free. It self-clears when the next review completes. If you expected one to finish, check agent.log around the start time.'
   } else if (s.doneAt != null && now - s.doneAt < RECENT_DONE_MS) {
     label = `review done ${ago(now - s.doneAt)} ago`
     detail = (s.doneSummary || `Last background review finished (result: ${s.doneResult || 'none'}).`) +
@@ -496,7 +549,8 @@ function Chip() {
           },
         }),
         jsx('span', { children: label }),
-        s.mode === 'idle' ? jsxs('span', {
+        // Bar shows on idle AND stale — only a live review suppresses the countdown.
+        s.mode !== 'running' ? jsxs('span', {
           style: { display: 'inline-flex', alignItems: 'center', gap: '4px' },
           children: [
             jsx(FillBar, { frac: barFrac }),
@@ -508,15 +562,15 @@ function Chip() {
   })
 }
 
-// Compaction chip: visible only while a batch compaction is running or within
-// RECENT_COMP_MS of its end. Renders null otherwise (no idle noise).
+// Compaction chip: always rendered. Running or within RECENT_COMP_MS of a finish it shows
+// the live/recent label; otherwise a quiet idle line with the LAST completion (persisted),
+// so "when did we last compact" is always one glance away.
 function CompactionChip() {
   const s = useWatch()
   const now = useNow()
   const c = s.compact
 
   const recentEnd = c.endedAt != null && now - c.endedAt < RECENT_COMP_MS
-  if (c.mode !== 'running' && !recentEnd) return null
 
   let dotColor = 'var(--ui-accent)'
   let label
@@ -527,10 +581,25 @@ function CompactionChip() {
     detail = `Batch context compaction in progress — the local model is summarizing the session middle (started at ~${fmtTokens(c.startTokens)} tokens).\n` +
       'First measured run (197K-token session) committed in ~4 min. The single inference slot is busy until it commits, so queued messages will wait.\n' +
       'Nothing is lost: a checkpoint is archived first, and the transcript stays searchable via session_search.'
+  } else if (!recentEnd) {
+    // Quiet idle. The last terminal state comes from the persisted record (survives window
+    // rotation / hot reloads); absent only before this install's first completion.
+    dotColor = 'var(--ui-text-quaternary)'
+    const last = c.lastRec
+    label = last ? `compact idle · last ${ago(now - last.endedAt)}` : 'compact idle'
+    detail = last
+      ? (last.committed === false
+        ? `Last batch compaction was aborted (${last.failure || 'unknown failure'}) — the session was left unchanged and it retries on the next trigger.`
+        : (last.doneFrom != null
+          ? `Last compaction committed: ${last.doneFrom} → ${last.doneTo} messages.`
+          : 'Last compaction committed.'))
+      : 'No batch context compression has completed since this plugin started keeping records. The chip goes live the moment one starts.'
   } else if (c.committed === false) {
+    dotColor = 'var(--ui-warning, #d97706)'
     label = `compact failed ${ago(now - c.endedAt)} ago`
     detail = `Compaction was aborted (${c.failure || 'unknown failure'}) — the session was left unchanged and will retry on the next compaction trigger.`
   } else {
+    dotColor = 'var(--ui-text-secondary)'
     label = `compact done ${ago(now - c.endedAt)} ago`
     detail = (c.doneFrom != null
       ? `Compaction committed: ${c.doneFrom} → ${c.doneTo} messages.`
@@ -575,7 +644,9 @@ export default {
   name: 'Background Review & Completion Watch',
   defaultEnabled: true,
   register(ctx) {
+    engineCtx = ctx
     ensureWired()
+    hydrateLastCompact() // async; resolves into state.compact.lastRec before the chip needs it
     const wiringTeardown = wiring // module-scoped; survives chip remounts
     ctx.register({
       id: 'chip',
