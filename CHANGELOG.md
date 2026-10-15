@@ -6,6 +6,30 @@ The project uses [Semantic Versioning](https://semver.org/). The first two
 versions below are reconstructed from the repository history; version 0.3.0 is
 the first release to carry an explicit `VERSION` file.
 
+## [0.4.1] - 2026-10-15
+
+### Fixed
+
+- **Unbounded "compacting" display** (incident 2026-10-15): the chip pinned
+  `compacting · 3h+` although the run's terminal line had been on disk hours
+  earlier (a compaction started 16:08 and committed 16:13; the badge kept
+  counting up for over three more hours, and a queued prompt was sent while it
+  still claimed the slot — the badge was stale, not running). Compaction
+  `running` state now carries a 60-minute orphan ceiling (measured runs on this
+  box: ~5 min and ~8 min):
+  - **Poll side** — a start marker older than 60 min with no terminal line
+    classifies as a new `stale` mode, shown amber as `compact stale · <age>`.
+  - **Render side (the real backstop)** — the chip caps at render time via the
+    shared `compactStale()` check: even if the reconcile poll is frozen (dead
+    poll loop or stuck log reader), the chip re-renders every second and
+    self-corrects to the stale label. The 10-15 freeze could not have been
+    surfaced by poll-side logic alone, which is why the cap exists in both
+    layers.
+
+The stale tooltip names the failure classes (run died without logging vs log
+reader frozen) and says to treat the badge as a false alarm when no compaction
+was observed — verify via `agent.log "context compression"`.
+
 ## [0.4.0] - 2026-10-15
 
 ### Added

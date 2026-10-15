@@ -64,6 +64,20 @@ const RECENT_GUARD_MS = 600000 // keep completion-boundary diagnostics visible f
 // 26 min (agent.log, 10-14 pairs); 4h leaves wide headroom over anything healthy.
 // Above it, "running" can only mean the process died without logging — report stale, not running.
 const STALE_REVIEW_MS = 4 * 60 * 60 * 1000
+// Orphan ceiling for COMPACTION. Measured runs on this box: ~5 min (10-14 18:34)
+// and ~8 min (10-15 19:32, ~200K tokens). A start marker older than 60 min with no
+// terminal line can only mean a run that died without logging (process/gateway
+// fault) — report stale, never "running". The chip ALSO caps at render time, so
+// even a frozen poll state cannot display an unbounded "compacting" (incident
+// 10-15: chip pinned "compacting · 3h+" although the terminal line had been on
+// disk for hours — poll-side classification alone could not surface it).
+const STALE_COMP_MS = 60 * 60 * 1000
+// Single source of truth for "this compaction state is over its orphan budget".
+// Used by reconcileCompaction (poll side) AND CompactionChip (render side — the
+// backstop that works even when poll state is frozen).
+function compactStale(mode, startedAt, now) {
+  return mode === 'running' && startedAt != null && now - startedAt > STALE_COMP_MS
+}
 const COMPACT_LAST_KEY = 'bg-review-watch.compact-last.v1' // ctx.storage key for the last terminal compaction
 
 const RE_START = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*OpenAI client created.*thread=bg-review:(\d+)/
@@ -342,8 +356,12 @@ async function reconcileCompaction() {
     const mlines = (mc && (mc.lines || mc.data || mc.logs)) || []
     const micro = collectMicroMarkers(mlines)
 
+    // Poll-side stale classification (the render-time cap in CompactionChip is the
+    // backstop for frozen state — see STALE_COMP_MS).
+    const compStale = running && compactStale('running', state.compact.startedAt || start, now)
+
     setCompact({
-      mode: running ? 'running' : 'idle',
+      mode: compStale ? 'stale' : running ? 'running' : 'idle',
       startedAt: running ? (state.compact.startedAt || start) : null,
       startTokens: running ? (state.compact.startTokens || startTokens) : null,
       endedAt,
@@ -572,11 +590,22 @@ function CompactionChip() {
 
   const recentEnd = c.endedAt != null && now - c.endedAt < RECENT_COMP_MS
 
+  // Render-time stale cap (v0.4.1): the chip re-renders every second via useNow, so
+  // even if reconcileCompaction's state is frozen at 'running' (poll loop dead or log
+  // reader stuck — incident 10-15: "compacting · 3h+" with the terminal line already
+  // on disk), an over-age start self-corrects HERE without waiting for a poll.
+  const mode = compactStale(c.mode, c.startedAt, now) ? 'stale' : c.mode
+
   let dotColor = 'var(--ui-accent)'
   let label
   let detail
 
-  if (c.mode === 'running') {
+  if (mode === 'stale') {
+    dotColor = 'var(--ui-warning, #d97706)'
+    label = `compact stale · ${ago(now - c.startedAt)}`
+    detail = `A compaction start marker is ${ago(now - c.startedAt)} old with no terminal (done/telemetry) line after it. A healthy batch run on this box takes ~4–8 min, so either a run died without logging (process/gateway fault) or the log reader froze.\n` +
+      'If you did not see compaction happen, treat the badge as a false alarm — verify with agent.log "context compression".'
+  } else if (mode === 'running') {
     label = `compacting · ${ago(now - c.startedAt)}`
     detail = `Batch context compaction in progress — the local model is summarizing the session middle (started at ~${fmtTokens(c.startTokens)} tokens).\n` +
       'First measured run (197K-token session) committed in ~4 min. The single inference slot is busy until it commits, so queued messages will wait.\n' +
@@ -630,7 +659,7 @@ function CompactionChip() {
             borderRadius: '50%',
             background: dotColor,
             display: 'inline-block',
-            animation: c.mode === 'running' ? 'bgrw-pulse 1.2s ease-in-out infinite' : 'none',
+            animation: mode === 'running' ? 'bgrw-pulse 1.2s ease-in-out infinite' : 'none',
           },
         }),
         jsx('span', { children: label }),
@@ -638,6 +667,10 @@ function CompactionChip() {
     }),
   })
 }
+
+// Test-only exports (smoke test drives the render-side cap without module internals).
+export { compactStale as __compactStaleForTests }
+export { reconcileCompaction as __reconcileCompactionForTests }
 
 export default {
   id: 'bg-review-watch',

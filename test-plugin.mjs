@@ -19,13 +19,16 @@ const logTs = msOffsetAgo => {
 const SPAWN_LINE = `${logTs(5 * HOUR)} INFO run_agent: OpenAI client created (agent_init, shared=True) thread=bg-review:33108 provider=custom base_url=http://127.0.0.1:8080/v1 model=Qwen38-27b-q8`
 const COMP_DONE_LINE = `${logTs(3 * DAY)} INFO agent.conversation_compression: context compression done: session=test_sess messages=120->45 rough_tokens=~55000 awaiting_real_usage=true`
 const COMP_TEL_LINE = `${logTs(3 * DAY + 500)} INFO agent.conversation_compression: context compression attempt telemetry: {"commit_status":"committed","failure_class":null,"total_duration_ms":241000}`
+// v0.4.1 case: orphaned compaction start 2h ago, no terminal line → STALE, not running.
+const COMP_START_ORPHAN = `${logTs(2 * HOUR)} INFO agent.conversation_compression: context compression started: session=test_sess messages=210 tokens=~199,555 model=Qwen38-27b-q8 focus=None`
+let compLines = [COMP_DONE_LINE, COMP_TEL_LINE]
 
 const eventHandlers = new Map()
 const host = {
   logs: async ({ search }) => ({
     lines:
       search === 'bg-review' ? [SPAWN_LINE]
-      : search === 'context compression' ? [COMP_DONE_LINE, COMP_TEL_LINE]
+      : search === 'context compression' ? compLines
       : [] // 'Turn ended', 'Micro-compaction', ticker — quiet
   }),
   onEvent(type, handler) {
@@ -70,6 +73,10 @@ await pluginModule.evaluate()
 const plugin = pluginModule.namespace.default
 assert.equal(plugin.id, 'bg-review-watch')
 assert.equal(plugin.defaultEnabled, true)
+// test-only named exports live on the namespace, not the default object
+const texp = pluginModule.namespace
+assert.equal(typeof texp.__compactStaleForTests, 'function', '__compactStaleForTests exported')
+assert.equal(typeof texp.__reconcileCompactionForTests, 'function', '__reconcileCompactionForTests exported')
 
 // ctx without storage (engine must guard — mirrors the sandbox when storage is absent).
 const contributions = []
@@ -124,6 +131,26 @@ assert.ok(text.includes('review done'), `expected review done after summary even
 // 3. compaction chip is ALWAYS rendered (no null branch) and shows the last completion age
 const compactText = renderedText(compactChip)
 assert.ok(compactText.includes('compact idle · last 3d'), `expected persisted last-compaction label, got: ${compactText}`)
+
+// 4. v0.4.1 poll side: orphaned compaction start (2h, no terminal line) → "compact stale",
+//    NOT "compacting". (Sleep clears the 5s reconcile debounce; then drive one poll.)
+compLines = [COMP_START_ORPHAN]
+await new Promise(resolve => setTimeout(resolve, 5300))
+await texp.__reconcileCompactionForTests()
+text = renderedText(compactChip)
+assert.ok(text.includes('compact stale'), `expected stale compaction label, got: ${text}`)
+assert.ok(!text.includes('compacting ·'), `stale compaction must not claim the slot: ${text}`)
+assert.ok(text.includes('false alarm'), `stale tooltip should name the false-alarm path: ${text}`)
+
+// 5. v0.4.1 render side: the shared cap fires on an over-age 'running' state even when
+//    the poll never ran (frozen state — the 10-15 failure mode).
+const cs = texp.__compactStaleForTests
+const nowMs = Date.now()
+assert.equal(cs('running', nowMs - 61 * 60 * 1000, nowMs), true, 'over-budget running → stale')
+assert.equal(cs('running', nowMs - 59 * 60 * 1000, nowMs), false, 'under-budget running stays running')
+assert.equal(cs('idle', nowMs - 3 * HOUR, nowMs), false, 'idle is never stale')
+assert.equal(cs('stale', nowMs - 3 * HOUR, nowMs), false, 'stale input is idempotent')
+assert.equal(cs('running', null, nowMs), false, 'no start marker → not stale')
 
 dispose()
 assert.equal(eventHandlers.size, 0)
