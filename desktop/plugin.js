@@ -8,21 +8,27 @@
 //     idle    → "review idle"   + fill bar: turns since last review / nudge interval
 //     running → "review running · 2m 14s" (pulsing dot, accent color)
 //     just done → "review done 3s ago" + the summary text in the tooltip
-//     stale   → "review stale · 16h 10m (no end line)" (warning dot) — a spawn marker
-//               with no terminal line older than STALE_REVIEW_MS. The review process died
-//               without logging (gateway reboot/kill/OOM); nothing is running, slot is free.
+//     stale   → "review stale · 16h 10m" (warning dot) — a spawn marker with no terminal
+//               line older than the review-stale ceiling (default 4h, configurable). The
+//               review process died without logging (gateway reboot/kill/OOM); nothing is
+//               running, slot is free. Capped in BOTH layers: poll-side classification AND
+//               render time (v0.5.0), so a frozen "running" state self-corrects at render.
 //   compaction chip (always):
 //     running → "compacting · 4m 12s" (pulsing dot, accent color)
 //     just done → "compact done 3m ago" / "compact failed 2m ago" (reduction or failure in tooltip)
 //     idle    → "compact idle · last 5d 2h" + the last committed reduction or failure class
 //               in the tooltip. The last terminal state is persisted via ctx.storage so it
 //               survives log-window rotation, hot reloads, and app restarts.
+//     stale   → "compact stale · <age>" when a start marker sits over its orphan ceiling
+//               (default 60 min, configurable) with no terminal line — capped in both layers.
 //
 // Data sources (all read-only, no Python backend, no gateway restart):
 //   - host.onEvent('review.summary')        → live review completion + summary text
 //   - host.onEvent('message.start')         → turn ticks for the review countdown
 //   - host.onEvent('message.complete')      → foreground delivery boundary
-//   - host.logs({ file:'agent', search:… }) → markers, 20s poll:
+//   - host.logs({ file:'agent', search:… }) → markers, self-rescheduling poll (20 s when
+//     healthy, 5 s fast-retry after two missed cycles); every read is wrapped in an 8 s
+//     timeout so a stalled reader degrades to a fail-open retry instead of freezing state:
 //       'bg-review'            → review start/complete markers
 //       'context compression'  → batch compaction started/done/attempt-telemetry markers
 //       'Micro-compaction'     → per-turn micro-compact pass results
@@ -34,8 +40,17 @@
 // Resilience: that equality assumes every spawn eventually logs a terminal line. It does not —
 // the review is a THREAD inside the gateway process (thread ident, not pid), and a reboot or
 // kill mid-review dies with no log at all (observed 2026-10-14: spawn 19:34, PC reboot 19:47,
-// no terminal line ever; chip pinned "running" for 16h+). A spawn older than STALE_REVIEW_MS
-// with no terminal line is therefore reported as `stale` (diagnostic), not `running`.
+// no terminal line ever; chip pinned "running" for 16h+). A spawn older than the review-stale
+// ceiling with no terminal line is therefore reported as `stale` (diagnostic), not `running`.
+//
+// Poll liveness (v0.5.0): the log reads above are the ONLY source of truth, and a stalled
+// reader used to wedge them forever — live incident 10-16/17: state frozen at "running"
+// anchored on a start whose terminal line had been on disk for hours; the v0.4.1 render cap
+// relabeled it "compact stale · 30h+" (correct label, unrecovered state). Now: (1) every
+// host.logs call has an 8 s timeout (a stall is a rejection the fail-open catch absorbs, and
+// the next cycle retries), and (2) the poll loop self-reschedules — two cycles without a
+// successful reconcile drop the cadence to 5 s until one succeeds, then back to 20 s. When a
+// stalled reader recovers, the next successful poll re-derives state from the live log.
 //
 // Compaction runs one at a time too (the compressor serializes attempts on the session).
 // A batch attempt logs `context compression started:` at attempt start and exactly one
@@ -52,33 +67,81 @@
 //   micro ok:   "<ts> INFO agent.turn_finalizer: Micro-compaction: A -> B messages"
 //   micro fail: "<ts> WARNING agent.turn_finalizer: Micro-compaction failed: <err>"
 
-import { host, STATUSBAR_AREAS, Tip } from '@hermes/plugin-sdk'
+import { host, STATUSBAR_AREAS, Tip, ListRow } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
 import { useSyncExternalStore, useState, useEffect } from 'react'
 
-const POLL_MS = 20000 // log poll cadence (idle cost is a few tiny server-side-filtered REST calls)
+const POLL_MS = 20000 // log poll cadence when healthy (idle cost: a few tiny server-side-filtered REST calls)
 const RECENT_DONE_MS = 600000 // keep the "done Xs ago" label for 10 min, then plain idle
 const RECENT_COMP_MS = 600000 // keep the compaction chip 10 min after a finish
 const RECENT_GUARD_MS = 600000 // keep completion-boundary diagnostics visible for 10 min
-// Orphan-spawn ceiling. Verified local-model review runs on this box: 22 min and
-// 26 min (agent.log, 10-14 pairs); 4h leaves wide headroom over anything healthy.
-// Above it, "running" can only mean the process died without logging — report stale, not running.
-const STALE_REVIEW_MS = 4 * 60 * 60 * 1000
-// Orphan ceiling for COMPACTION. Measured runs on this box: ~5 min (10-14 18:34)
-// and ~8 min (10-15 19:32, ~200K tokens). A start marker older than 60 min with no
-// terminal line can only mean a run that died without logging (process/gateway
-// fault) — report stale, never "running". The chip ALSO caps at render time, so
-// even a frozen poll state cannot display an unbounded "compacting" (incident
-// 10-15: chip pinned "compacting · 3h+" although the terminal line had been on
-// disk for hours — poll-side classification alone could not surface it).
-const STALE_COMP_MS = 60 * 60 * 1000
+
+// Orphan-spawn ceilings — DEFAULTS. Both are user-configurable (minutes) via
+// Settings ▸ Plugins ▸ Thresholds and persist in ctx.storage (SETTINGS_KEY).
+// Verified local-model review runs on this box: 22 min and 26 min (agent.log, 10-14 pairs);
+// 4h leaves wide headroom over anything healthy. Above the ceiling, "running" can only mean
+// the process died without logging — report stale, not running.
+const DEFAULT_REVIEW_STALE_MIN = 4 * 60
+// Orphan ceiling for COMPACTION (default). Measured runs on this box: ~5 min (10-14 18:34)
+// and ~8 min (10-15 19:32, ~200K tokens). A start marker older than the ceiling with no
+// terminal line can only mean a run that died without logging (process/gateway fault) —
+// report stale, never "running". The chip ALSO caps at render time, so even a frozen poll
+// state cannot display an unbounded "compacting" (incident 10-15: chip pinned
+// "compacting · 3h+" although the terminal line had been on disk for hours — poll-side
+// classification alone could not surface it).
+const DEFAULT_COMPACT_STALE_MIN = 60
+const MIN_STALE_MIN = 1
+const MAX_STALE_MIN = 7 * 24 * 60 // a ceiling above one week is meaningless
+
+const SETTINGS_KEY = 'bg-review-watch.settings.v1'       // ctx.storage: { v, reviewStaleMin, compactStaleMin }
+const REVIEW_LAST_KEY = 'bg-review-watch.review-last.v1' // ctx.storage: last terminal review record
+const COMPACT_LAST_KEY = 'bg-review-watch.compact-last.v1' // ctx.storage key for the last terminal compaction
+
+// Log reads must not hang forever: a stalled reader used to freeze the poll state (the
+// 10-16/17 "compact stale · 30h+" incident — see header). An 8 s timeout turns a stall into
+// a fail-open retry; the self-rescheduling timer in ensureWired() retries fast while polls
+// are unhealthy and re-derives state from the live log on recovery.
+const LOG_TIMEOUT_MS = 8000
+// Poll liveness: more than two missed cycles without a successful reconcile → fast-retry cadence.
+const UNHEALTHY_AFTER_MS = 2 * POLL_MS
+const FAST_RETRY_MS = 5000
+
+// Reject if `promise` does not settle within `ms`. The original promise is left to run to
+// completion (read-only tail) — its late result is simply ignored.
+function withTimeout(promise, ms, label) {
+  let t
+  const timeout = new Promise((_, reject) => {
+    t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t))
+}
+
 // Single source of truth for "this compaction state is over its orphan budget".
 // Used by reconcileCompaction (poll side) AND CompactionChip (render side — the
 // backstop that works even when poll state is frozen).
-function compactStale(mode, startedAt, now) {
-  return mode === 'running' && startedAt != null && now - startedAt > STALE_COMP_MS
+function compactStale(mode, startedAt, now, limitMs = DEFAULT_COMPACT_STALE_MIN * 60000) {
+  return mode === 'running' && startedAt != null && now - startedAt > limitMs
 }
-const COMPACT_LAST_KEY = 'bg-review-watch.compact-last.v1' // ctx.storage key for the last terminal compaction
+// Review-side twin of the render-time cap (v0.5.0): a frozen "review running" state must
+// degrade to stale at render time too, not count up unbounded — before v0.5.0 the review
+// chip had only the poll-side classification (the compaction chip got both layers in 0.4.1).
+function reviewStale(mode, startedAt, now, limitMs = DEFAULT_REVIEW_STALE_MIN * 60000) {
+  return mode === 'running' && startedAt != null && now - startedAt > limitMs
+}
+
+// Sanitize user-provided thresholds (Settings page). Minutes; clamped to [MIN, MAX],
+// defaults win on junk. Pure — safe to call from the render path.
+function sanitizeSettings(raw) {
+  const get = (k, def) => {
+    const n = Number(raw && raw[k])
+    return Number.isFinite(n) && n >= MIN_STALE_MIN ? Math.min(MAX_STALE_MIN, Math.floor(n)) : def
+  }
+  return {
+    v: 1,
+    reviewStaleMin: get('reviewStaleMin', DEFAULT_REVIEW_STALE_MIN),
+    compactStaleMin: get('compactStaleMin', DEFAULT_COMPACT_STALE_MIN),
+  }
+}
 
 const RE_START = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*OpenAI client created.*thread=bg-review:(\d+)/
 const RE_DONE = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+.*(Background review complete|Background memory\/skill review failed)(?:.*result=(\w+))?/
@@ -117,6 +180,10 @@ function fmtTokens(n) {
   if (n >= 1000) return `${Math.round(n / 1000)}K`
   return String(n)
 }
+function trimSummary(t) {
+  const s = (t || '').trim()
+  return s.length > 160 ? `${s.slice(0, 157)}…` : s
+}
 
 // ── plugin-global state (shared by the chips; module-scoped = survives chip re-mounts) ──
 let state = {
@@ -135,6 +202,9 @@ let state = {
   tickerRecoveryAt: null,
   tickerRecoverySession: null,
   guardLastPoll: 0,
+  staleReviewMs: DEFAULT_REVIEW_STALE_MIN * 60000, // user-configurable (Settings ▸ Thresholds)
+  staleCompactMs: DEFAULT_COMPACT_STALE_MIN * 60000,
+  reviewLastRec: null, // { v, endedAt, result, summary } — persisted via ctx.storage
   compact: {
     mode: 'idle', // 'idle' | 'running'
     startedAt: null,
@@ -150,6 +220,10 @@ let state = {
     lastRec: null, // { v, endedAt, committed, failure, doneFrom, doneTo } — persisted via ctx.storage
   },
 }
+// Liveness marker for the poll loop (module-scoped, not render-relevant): when the LAST
+// successful reconcile processed data. The self-rescheduling timer compares Date.now()
+// against this to decide POLL_MS vs FAST_RETRY_MS.
+let lastGoodPoll = Date.now()
 let subs = new Set()
 function set(patch) {
   state = { ...state, ...patch }
@@ -163,6 +237,26 @@ function setCompact(patch) {
 // ctx of the current plugin registration (for storage); null under the smoke test.
 let engineCtx = null
 
+async function hydrateSettings() {
+  if (!engineCtx || !engineCtx.storage) return
+  try {
+    const rec = await engineCtx.storage.get(SETTINGS_KEY)
+    if (rec && rec.v === 1) applySettings(rec)
+  } catch { /* storage blip — defaults stand */ }
+}
+
+function persistSettings(rec) {
+  if (!engineCtx || !engineCtx.storage) return
+  engineCtx.storage.set(SETTINGS_KEY, rec).catch(() => {})
+}
+
+// Sanitize + persist + apply. Called from the Settings page (user value) and hydrate (stored value).
+function applySettings(raw) {
+  const s = sanitizeSettings(raw)
+  persistSettings(s)
+  set({ staleReviewMs: s.reviewStaleMin * 60000, staleCompactMs: s.compactStaleMin * 60000 })
+}
+
 async function hydrateLastCompact() {
   if (!engineCtx || !engineCtx.storage) return
   try {
@@ -174,6 +268,19 @@ async function hydrateLastCompact() {
 function persistLastCompact(rec) {
   if (!engineCtx || !engineCtx.storage) return
   engineCtx.storage.set(COMPACT_LAST_KEY, rec).catch(() => {})
+}
+
+async function hydrateReviewLast() {
+  if (!engineCtx || !engineCtx.storage) return
+  try {
+    const rec = await engineCtx.storage.get(REVIEW_LAST_KEY)
+    if (rec && rec.v === 1 && typeof rec.endedAt === 'number') set({ reviewLastRec: rec })
+  } catch { /* storage blip — the tooltip stands without history */ }
+}
+
+function persistReviewLast(rec) {
+  if (!engineCtx || !engineCtx.storage) return
+  engineCtx.storage.set(REVIEW_LAST_KEY, rec).catch(() => {})
 }
 
 function collectReviewMarkers(lines) {
@@ -265,14 +372,14 @@ async function reconcile() {
   if (now - state.lastPoll < 5000) return // debounce overlapping calls
   state.lastPoll = now
   try {
-    const rev = await host.logs({ file: 'agent', lines: 200, search: 'bg-review' })
+    const rev = await withTimeout(host.logs({ file: 'agent', lines: 200, search: 'bg-review' }), LOG_TIMEOUT_MS, 'agent.log poll (bg-review)')
     const lines = (rev && (rev.lines || rev.data || rev.logs)) || []
     const { start, done, result } = collectReviewMarkers(lines)
 
     // turns since the last completion (only needed when idle)
     let turns = state.turnsSince
     if (done != null) {
-      const tr = await host.logs({ file: 'agent', lines: 5000, search: 'Turn ended' })
+      const tr = await withTimeout(host.logs({ file: 'agent', lines: 5000, search: 'Turn ended' }), LOG_TIMEOUT_MS, 'agent.log poll (Turn ended)')
       const tlines = ((tr && (tr.lines || tr.data || tr.logs)) || []).map(lineText)
       turns = tlines.filter((t) => {
         const m = RE_TURN.exec(t)
@@ -281,12 +388,29 @@ async function reconcile() {
     }
 
     // `live` = the log evidence says a review is in flight; `stale` = that claim is old
-    // enough that only process death explains it (no terminal line survives a reboot/kill).
+    // enough (over the configurable ceiling) that only process death explains it — no
+    // terminal line survives a reboot/kill. The render-time cap in Chip is the twin
+    // backstop for frozen state (v0.5.0).
     const live = start != null && (done == null || start > done)
-    const stale = live && now - start > STALE_REVIEW_MS
+    const stale = live && now - start > state.staleReviewMs
     const overlap = start != null && state.foregroundStartedAt != null &&
       start >= state.foregroundStartedAt &&
       (state.foregroundCompletedAt == null || start < state.foregroundCompletedAt)
+
+    // Persist the newest terminal review (log path: result from the marker, no summary
+    // text — the live review.summary event path writes the richer record; it wins on ties
+    // because it is never older than the marker's own timestamp).
+    let lastRec = state.reviewLastRec
+    if (done != null && (!lastRec || done > (lastRec.endedAt || 0) || (done === (lastRec.endedAt || 0) && !lastRec.summary))) {
+      lastRec = {
+        v: 1,
+        endedAt: done,
+        result: result != null ? result : (lastRec && lastRec.result) || null,
+        summary: (lastRec && lastRec.summary) || null,
+      }
+      persistReviewLast(lastRec)
+    }
+
     set({
       mode: stale ? 'stale' : live ? 'running' : 'idle',
       startedAt: live ? (state.startedAt || start) : null,
@@ -295,9 +419,12 @@ async function reconcile() {
       // Only a genuinely running review holds the slot; stale/idle report the real countdown.
       turnsSince: live && !stale ? 0 : turns,
       reviewOverlapAt: overlap ? start : state.reviewOverlapAt,
+      reviewLastRec: lastRec,
     })
+    lastGoodPoll = Date.now()
   } catch {
-    /* fail-open: keep last state on a REST blip */
+    /* fail-open: keep last state on a REST blip or a timed-out read (the liveness
+       cadence in ensureWired notices via lastGoodPoll and retries fast) */
   }
 }
 
@@ -306,7 +433,7 @@ async function reconcileGuard() {
   if (now - state.guardLastPoll < 5000) return
   state.guardLastPoll = now
   try {
-    const result = await host.logs({ file: 'agent', lines: 100, search: 'usage ticker stop timed out' })
+    const result = await withTimeout(host.logs({ file: 'agent', lines: 100, search: 'usage ticker stop timed out' }), LOG_TIMEOUT_MS, 'agent.log poll (ticker)')
     const lines = (result && (result.lines || result.data || result.logs)) || []
     let at = null
     let session = null
@@ -316,6 +443,7 @@ async function reconcileGuard() {
       if (t && (at == null || t > at)) { at = t; session = m[2] }
     }
     set({ tickerRecoveryAt: at, tickerRecoverySession: session })
+    lastGoodPoll = Date.now()
   } catch {
     /* fail-open: keep last state on a REST blip */
   }
@@ -328,7 +456,7 @@ async function reconcileCompaction() {
   try {
     // 3000-line window: a batch compaction can run 20+ min, and the log keeps
     // accumulating unrelated lines while it runs — the start line must stay in view.
-    const c = await host.logs({ file: 'agent', lines: 3000, search: 'context compression' })
+    const c = await withTimeout(host.logs({ file: 'agent', lines: 3000, search: 'context compression' }), LOG_TIMEOUT_MS, 'agent.log poll (compaction)')
     const clines = (c && (c.lines || c.data || c.logs)) || []
     const { start, startTokens, end, tel, doneFrom, doneTo } = collectCompactionMarkers(clines)
 
@@ -352,13 +480,13 @@ async function reconcileCompaction() {
       persistLastCompact(lastRec)
     }
 
-    const mc = await host.logs({ file: 'agent', lines: 500, search: 'Micro-compaction' })
+    const mc = await withTimeout(host.logs({ file: 'agent', lines: 500, search: 'Micro-compaction' }), LOG_TIMEOUT_MS, 'agent.log poll (micro)')
     const mlines = (mc && (mc.lines || mc.data || mc.logs)) || []
     const micro = collectMicroMarkers(mlines)
 
-    // Poll-side stale classification (the render-time cap in CompactionChip is the
-    // backstop for frozen state — see STALE_COMP_MS).
-    const compStale = running && compactStale('running', state.compact.startedAt || start, now)
+    // Poll-side stale classification against the configurable ceiling (the render-time cap
+    // in CompactionChip is the backstop for frozen state — see compactStale).
+    const compStale = running && compactStale('running', state.compact.startedAt || start, now, state.staleCompactMs)
 
     setCompact({
       mode: compStale ? 'stale' : running ? 'running' : 'idle',
@@ -373,8 +501,9 @@ async function reconcileCompaction() {
       microDetail: micro.detail,
       lastRec,
     })
+    lastGoodPoll = Date.now()
   } catch {
-    /* fail-open: keep last state on a REST blip */
+    /* fail-open: keep last state on a REST blip or a timed-out read */
   }
 }
 
@@ -396,6 +525,7 @@ let wiring = null
 function ensureWired() {
   if (wiring) return
   wiring = (function wire() {
+    lastGoodPoll = Date.now() // initial cycle is in flight from the calls below
     loadIntervals()
     reconcile()
     reconcileCompaction()
@@ -414,6 +544,10 @@ function ensureWired() {
       host.onEvent('review.summary', (ev) => {
         const text = (ev && (ev.text || (ev.data && ev.data.text))) || ''
         const m = /result=(\w+)/.exec(text)
+        // Live completion: the richest record (carries the summary text). Persist it —
+        // the log path in reconcile() keeps it on ties and never overwrites a newer one.
+        const rec = { v: 1, endedAt: Date.now(), result: m ? m[1] : null, summary: text }
+        persistReviewLast(rec)
         set({
           mode: 'idle',
           startedAt: null,
@@ -421,12 +555,32 @@ function ensureWired() {
           doneResult: m ? m[1] : null,
           doneSummary: text,
           turnsSince: 0,
+          reviewLastRec: rec,
         })
       }),
     ]
-    const poll = setInterval(() => { reconcile(); reconcileCompaction(); reconcileGuard() }, POLL_MS)
+    // Self-rescheduling poll (v0.5.0): a bare setInterval kept ticking even when every
+    // cycle died inside a hung log read, which is how the 10-16/17 frozen state happened.
+    // This timer only ever schedules the NEXT tick after the current cycle settles (the
+    // withTimeout wrappers guarantee it settles), and drops to FAST_RETRY_MS while no
+    // reconcile has succeeded within UNHEALTHY_AFTER_MS — so a stalled reader recovers
+    // on its own, and recovery re-derives state from the live log.
+    let pollTimer = null
+    const scheduleNext = (delayMs) => {
+      if (!wiring) return // torn down while scheduling
+      pollTimer = setTimeout(tick, delayMs)
+    }
+    const tick = () => {
+      if (!wiring) return
+      Promise.allSettled([reconcile(), reconcileCompaction(), reconcileGuard()]).then(() => {
+        if (!wiring) return
+        const overdue = Date.now() - lastGoodPoll > UNHEALTHY_AFTER_MS
+        scheduleNext(overdue ? FAST_RETRY_MS : POLL_MS)
+      })
+    }
+    scheduleNext(POLL_MS)
     return () => {
-      clearInterval(poll)
+      if (pollTimer) clearTimeout(pollTimer)
       offs.forEach((off) => off && off())
       wiring = null
     }
@@ -518,28 +672,39 @@ function Chip() {
   const memLeft = Math.max(0, s.memInterval - s.turnsSince)
   const barFrac = s.turnsSince / s.memInterval
 
+  // Render-time stale cap (v0.5.0): the twin of CompactionChip's backstop — the chip
+  // re-renders every second via useNow, so even if reconcile's state is frozen at
+  // 'running' (poll loop dead or log reader stuck), an over-ceiling start self-corrects
+  // HERE without waiting for a poll. Before v0.5.0 this chip had the poll-side
+  // classification only and could display "review running" unbounded.
+  const mode = reviewStale(s.mode, s.startedAt, now, s.staleReviewMs) ? 'stale' : s.mode
+
   let dotColor = 'var(--ui-text-quaternary)'
   let textColor = 'var(--ui-text-tertiary)'
   let label
   let detail
 
-  if (s.mode === 'running') {
+  const rec = s.reviewLastRec
+  if (mode === 'running') {
     dotColor = 'var(--ui-accent)'
     textColor = 'var(--ui-accent)'
     label = `review running · ${ago(now - s.startedAt)}`
     detail = 'Background self-improvement review is in progress. It replays the recent conversation on the local model and may update memory/skills. The bar shows the nudge countdown for the next run.'
-  } else if (s.mode === 'stale') {
+  } else if (mode === 'stale') {
     dotColor = 'var(--ui-warning, #d97706)'
     textColor = dotColor
     label = `review stale · ${ago(now - s.startedAt)}`
-    detail = 'A background review spawned but never logged a completion line — the gateway process most likely rebooted or was killed mid-review, so no inference is actually running and the local-model slot is free. It self-clears when the next review completes. If you expected one to finish, check agent.log around the start time.'
+    detail = `A background review spawned but never logged a completion line, and its start marker is now over the ${Math.round(s.staleReviewMs / 60000)}-min ceiling. The gateway process most likely rebooted or was killed mid-review, so no inference is actually running and the local-model slot is free. It self-clears when the next review completes. If you expected one to finish, check agent.log around the start time.`
   } else if (s.doneAt != null && now - s.doneAt < RECENT_DONE_MS) {
     label = `review done ${ago(now - s.doneAt)} ago`
-    detail = (s.doneSummary || `Last background review finished (result: ${s.doneResult || 'none'}).`) +
+    const summary = s.doneSummary || (rec && rec.summary) || ''
+    detail = (summary || `Last background review finished (result: ${s.doneResult || 'none'}).`) +
       `\nNext nudge in ${memLeft} turns — memory ${s.turnsSince}/${s.memInterval}, skill ${s.turnsSince}/${s.skillInterval}`
   } else {
     label = 'review idle'
-    detail = `No background review running. Next nudge in ${memLeft} turns — memory ${s.turnsSince}/${s.memInterval}, skill ${s.turnsSince}/${s.skillInterval}`
+    detail = `No background review running. Next nudge in ${memLeft} turns — memory ${s.turnsSince}/${s.memInterval}, skill ${s.turnsSince}/${s.skillInterval}` +
+      (rec ? `\nLast background review finished ${ago(now - rec.endedAt)} ago (result: ${rec.result || 'none'})` +
+        (rec.summary ? ` — ${trimSummary(rec.summary)}` : '') : '')
   }
 
   return jsxs(Tip, {
@@ -563,12 +728,12 @@ function Chip() {
             borderRadius: '50%',
             background: dotColor,
             display: 'inline-block',
-            animation: s.mode === 'running' ? 'bgrw-pulse 1.2s ease-in-out infinite' : 'none',
+            animation: mode === 'running' ? 'bgrw-pulse 1.2s ease-in-out infinite' : 'none',
           },
         }),
         jsx('span', { children: label }),
         // Bar shows on idle AND stale — only a live review suppresses the countdown.
-        s.mode !== 'running' ? jsxs('span', {
+        mode !== 'running' ? jsxs('span', {
           style: { display: 'inline-flex', alignItems: 'center', gap: '4px' },
           children: [
             jsx(FillBar, { frac: barFrac }),
@@ -594,7 +759,8 @@ function CompactionChip() {
   // even if reconcileCompaction's state is frozen at 'running' (poll loop dead or log
   // reader stuck — incident 10-15: "compacting · 3h+" with the terminal line already
   // on disk), an over-age start self-corrects HERE without waiting for a poll.
-  const mode = compactStale(c.mode, c.startedAt, now) ? 'stale' : c.mode
+  // v0.5.0: the ceiling is the user-configurable one (Settings ▸ Thresholds).
+  const mode = compactStale(c.mode, c.startedAt, now, s.staleCompactMs) ? 'stale' : c.mode
 
   let dotColor = 'var(--ui-accent)'
   let label
@@ -603,7 +769,7 @@ function CompactionChip() {
   if (mode === 'stale') {
     dotColor = 'var(--ui-warning, #d97706)'
     label = `compact stale · ${ago(now - c.startedAt)}`
-    detail = `A compaction start marker is ${ago(now - c.startedAt)} old with no terminal (done/telemetry) line after it. A healthy batch run on this box takes ~4–8 min, so either a run died without logging (process/gateway fault) or the log reader froze.\n` +
+    detail = `A compaction start marker is ${ago(now - c.startedAt)} old — over the ${Math.round(s.staleCompactMs / 60000)}-min orphan ceiling — with no terminal (done/telemetry) line after it. A healthy batch run on this box takes ~4–8 min, so either a run died without logging (process/gateway fault) or the log reader froze (the poll self-recovers since v0.5.0). ` +
       'If you did not see compaction happen, treat the badge as a false alarm — verify with agent.log "context compression".'
   } else if (mode === 'running') {
     label = `compacting · ${ago(now - c.startedAt)}`
@@ -668,9 +834,68 @@ function CompactionChip() {
   })
 }
 
-// Test-only exports (smoke test drives the render-side cap without module internals).
+// Settings ▸ Plugins ▸ Thresholds — the two orphan ceilings, in minutes. Theme vars only;
+// values commit on blur (mid-typing is not persisted) and are sanitized by sanitizeSettings.
+const INPUT_STYLE = {
+  width: '96px', padding: '4px 8px', fontSize: '0.75rem',
+  color: 'var(--foreground)', background: 'transparent',
+  border: '1px solid var(--border)', borderRadius: '6px',
+}
+const BUTTON_STYLE = {
+  padding: '4px 12px', fontSize: '0.75rem', cursor: 'pointer',
+  color: 'var(--foreground)', background: 'transparent',
+  border: '1px solid var(--border)', borderRadius: '6px',
+}
+
+function minOf(ms) {
+  return Math.round(ms / 60000)
+}
+
+function ThresholdsPage() {
+  const s = useWatch()
+  const current = () => ({ reviewStaleMin: minOf(s.staleReviewMs), compactStaleMin: minOf(s.staleCompactMs) })
+  const commit = (key) => (e) => { applySettings({ ...current(), [key]: e.target.valueAsNumber }) }
+  return jsxs('div', {
+    style: { display: 'flex', flexDirection: 'column' },
+    children: [
+      jsx(ListRow, {
+        title: 'Review stale ceiling (minutes)',
+        description: `Minutes before a background review without a completion line reports "review stale" instead of "review running". Default ${DEFAULT_REVIEW_STALE_MIN} — measured healthy local-model runs here take 22–26 min. Raise it only if you see false "stale" on unusually long runs.`,
+        action: jsx('input', {
+          key: `rev-${s.staleReviewMs}`,
+          type: 'number', min: MIN_STALE_MIN, max: MAX_STALE_MIN, step: 5,
+          defaultValue: minOf(s.staleReviewMs), style: INPUT_STYLE, onBlur: commit('reviewStaleMin'),
+        }),
+      }),
+      jsx(ListRow, {
+        title: 'Compaction stale ceiling (minutes)',
+        description: `Minutes before a compaction start without a terminal line reports "compact stale" instead of "compacting". Default ${DEFAULT_COMPACT_STALE_MIN} — measured healthy batch runs here take ~4–8 min.`,
+        action: jsx('input', {
+          key: `cmp-${s.staleCompactMs}`,
+          type: 'number', min: MIN_STALE_MIN, max: MAX_STALE_MIN, step: 5,
+          defaultValue: minOf(s.staleCompactMs), style: INPUT_STYLE, onBlur: commit('compactStaleMin'),
+        }),
+      }),
+      jsx(ListRow, {
+        title: 'Restore defaults',
+        description: `Review ${DEFAULT_REVIEW_STALE_MIN} min · compaction ${DEFAULT_COMPACT_STALE_MIN} min.`,
+        action: jsx('button', {
+          type: 'button', style: BUTTON_STYLE, children: 'Reset',
+          onClick: () => applySettings(current()),
+        }),
+      }),
+    ],
+  })
+}
+
+// Test-only exports (smoke test drives the render-side caps, sanitization and timeout
+// without module internals).
 export { compactStale as __compactStaleForTests }
+export { reviewStale as __reviewStaleForTests }
+export { sanitizeSettings as __sanitizeSettingsForTests }
+export { withTimeout as __withTimeoutForTests }
 export { reconcileCompaction as __reconcileCompactionForTests }
+export { reconcile as __reconcileForTests }
 
 export default {
   id: 'bg-review-watch',
@@ -679,7 +904,9 @@ export default {
   register(ctx) {
     engineCtx = ctx
     ensureWired()
+    hydrateSettings() // async; thresholds apply on resolve (defaults stand until then)
     hydrateLastCompact() // async; resolves into state.compact.lastRec before the chip needs it
+    hydrateReviewLast() // async; resolves into state.reviewLastRec for the idle/done tooltips
     const wiringTeardown = wiring // module-scoped; survives chip remounts
     ctx.register({
       id: 'chip',
@@ -699,6 +926,17 @@ export default {
       order: 142,
       render: () => jsx(GuardChip, {}),
     })
+    // Optional seam: hosts without registerSettingsPage (older builds) skip the page —
+    // the chips still work with the built-in defaults.
+    if (typeof ctx.registerSettingsPage === 'function') {
+      ctx.registerSettingsPage({
+        id: 'thresholds',
+        title: 'Thresholds',
+        icon: 'watch',
+        order: 10,
+        render: () => jsx(ThresholdsPage, {}),
+      })
+    }
     // pulse keyframe (cosmetic; scoped to this plugin's lifetime)
     let styleEl = null
     try {

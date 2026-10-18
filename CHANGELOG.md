@@ -6,6 +6,51 @@ The project uses [Semantic Versioning](https://semver.org/). The first two
 versions below are reconstructed from the repository history; version 0.3.0 is
 the first release to carry an explicit `VERSION` file.
 
+## [0.5.0] - 2026-10-19
+
+### Fixed
+
+- **Frozen poll state can no longer persist** (live incident 2026-10-16/17: the
+  chip showed `compact stale · 30h+` anchored on a run whose terminal line had
+  been on disk for hours — v0.4.1's render cap labeled it correctly, but nothing
+  ever recovered the state). Root cause: `host.logs` reads had no timeout and a
+  stalled reader wedged every later poll; the bare `setInterval` kept ticking
+  into the void. Now:
+  - every log read is wrapped in an **8 s timeout** — a stall becomes a
+    rejection the fail-open catch absorbs, and the next cycle retries;
+  - the poll loop **self-reschedules**: two cycles without a successful
+    reconcile drop the cadence to 5 s until one succeeds, then back to 20 s.
+    When a stalled reader recovers, the next successful poll re-derives state
+    from the live log — no restart, no user action.
+- **Review chip render-time stale cap**: the twin of v0.4.1's compaction
+  backstop. A frozen "review running" now self-corrects to `review stale` at
+  render time (previously the review chip had only the poll-side classification
+  and could display an unbounded elapsed time — the 2026-10-14 16h incident
+  class).
+
+### Added
+
+- **Configurable orphan ceilings** — Settings ▸ Plugins ▸ Thresholds:
+  review-stale ceiling (default 240 min) and compaction-stale ceiling
+  (default 60 min), in minutes, applied live without a reload. Persisted via
+  `ctx.storage` (`bg-review-watch.settings.v1`), sanitized (clamped to
+  1 min – 7 days, defaults on junk), with a Reset row. Older hosts without
+  `ctx.registerSettingsPage` skip the page and keep the built-in defaults.
+- **Persisted last review result** (`bg-review-watch.review-last.v1`): the
+  completion tooltip now survives the log window rolling past, hot reloads,
+  and app restarts — the same treatment v0.4.0 gave the compaction chip. The
+  idle tooltip names when the last background review finished (and what it
+  produced, from the live `review.summary` path); the log path writes the
+  record without summary text and never clobbers a richer event record.
+
+### Changed
+
+- Stale tooltips now name the active ceiling in minutes, so a configured
+  value is visible where it acts.
+- Smoke test extended: review-side render cap with custom ceilings, settings
+  sanitization, log-read timeout, persisted review record reaching the idle
+  tooltip, and settings-page registration/render.
+
 ## [0.4.1] - 2026-10-15
 
 ### Fixed
@@ -99,6 +144,7 @@ was observed — verify via `agent.log "context compression"`.
 - Add the turn-based memory and skill nudge countdown bar.
 - Detect review lifecycle through live events and filtered `agent.log` polls.
 
+[0.5.0]: https://github.com/vectorforge22/bg-review-watch/compare/v0.4.1...v0.5.0
 [0.4.0]: https://github.com/vectorforge22/bg-review-watch/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/vectorforge22/bg-review-watch/compare/eb49f35...v0.3.0
 [0.2.0]: https://github.com/vectorforge22/bg-review-watch/compare/7a222e1...eb49f35
