@@ -4,7 +4,7 @@
 > Entry file: `plugin-catalog/background-review-watch.yaml` (mirror kept in this repo at
 > `docs/catalog-submission/background-review-watch.yaml`).
 > **Owner submission**: the PR author (vectorforge22) owns the plugin repo.
-> Pin: `e673f95acf46a5c7026cba484accd4c7d6e9a79c` — vectorforge22/background-review-watch
+> Pin: `75c6f45741021529e19f87bbf2803ea1b608aa5e` — vectorforge22/background-review-watch
 > `unreleased` (v0.5.0). `hermes plugins validate` passes at that commit
 > (manifest OK, loadable `desktop/plugin.js`, **security scan safe**, no core
 > override, desktop surface inside the plugin SDK).
@@ -96,7 +96,7 @@ review completion, background-review-watch shows what that gate is waiting for.)
 - `plugin-catalog/background-review-watch.yaml` — **the only file this PR changes**:
   new entry, `tier: community`, `category: desktop`,
   `requires_hermes: ">=0.21.5"`, `version: "0.5.0"`, exact-SHA pin
-  `e673f95acf46a5c7026cba484accd4c7d6e9a79c`, two sha-pinned screenshots,
+  `75c6f45741021529e19f87bbf2803ea1b608aa5e`, two sha-pinned screenshots,
   empty capability lists (renderer-only).
 
 What the pinned version contains, by file in the plugin repo:
@@ -107,7 +107,7 @@ What the pinned version contains, by file in the plugin repo:
 ## How to Test
 
 1. Clone at the pin:
-   `git clone https://github.com/vectorforge22/background-review-watch && cd background-review-watch && git checkout e673f95acf46a5c7026cba484accd4c7d6e9a79c`
+   `git clone https://github.com/vectorforge22/background-review-watch && cd background-review-watch && git checkout 75c6f45741021529e19f87bbf2803ea1b608aa5e`
 2. `node --experimental-vm-modules test-plugin.mjs` → passes: orphan spawn →
    stale → cleared by `review.summary`; always-on compaction chip with
    persisted last run; both render-time stale caps incl. custom ceilings;
@@ -125,7 +125,7 @@ What the pinned version contains, by file in the plugin repo:
 ### Code
 
 - [x] I've read the [Contributing Guide](https://github.com/NousResearch/hermes-agent/blob/main/CONTRIBUTING.md)
-- [x] My commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (`fix(scope):`, `feat(scope):`, etc.) — single commit: `chore(plugin-catalog): add background-review-watch v0.5.0 entry (e673f95)`
+- [x] My commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (`fix(scope):`, `feat(scope):`, etc.) — single commit: `chore(plugin-catalog): add background-review-watch v0.5.0 entry (75c6f45)`
 - [x] I searched for [existing PRs](https://github.com/NousResearch/hermes-agent/pulls) to make sure this isn't a duplicate — no existing or open `background-review-watch` entry; catalog audited 2026-10 (401 entries at upstream HEAD + live search); nearest neighbors (`agent-log`, `hermes-monitor`, `context-audit`) cover different surfaces
 - [x] My PR contains **only** changes related to this fix/feature (no unrelated commits) — one catalog YAML file
 - [ ] I've run `pytest tests/ -q` and all tests pass — N/A: single-file catalog YAML, no Python touched; CI's gate remains authoritative
@@ -148,7 +148,7 @@ What the pinned version contains, by file in the plugin repo:
   the nudge fill bar and `compact idle · last 33h 5m`; `review-running.png` —
   `review running · 3m 46s` alongside the idle compaction chip (seeded inertly
   for the capture; seed removed and verified by hash afterwards, nothing sent).
-- **Log:** `hermes plugins validate` at `e673f95` → `Validation passed` —
+- **Log:** `hermes plugins validate` at `75c6f45` → `Validation passed` —
   security scan safe · no core override · desktop surface stays inside the
   plugin SDK.
 
@@ -158,7 +158,7 @@ What the pinned version contains, by file in the plugin repo:
 
 - [x] Re-run `hermes plugins validate` against a fresh clone at the pinned SHA
       (not just the working tree) — done 2026-10-19: `Validation passed` at
-      `e673f95` on a clean local clone (expected warning: manifest-only plugin,
+      `75c6f45` on a clean local clone (expected warning: manifest-only plugin,
       capability probe skipped)
 - [x] README at the pinned SHA renders acceptably (it's the catalog page) —
       plain markdown + one table; reviewed at the pin
@@ -172,7 +172,7 @@ What the pinned version contains, by file in the plugin repo:
 - [ ] Fork NousResearch/hermes-agent → add `plugin-catalog/background-review-watch.yaml`
       (bytes from `docs/catalog-submission/background-review-watch.yaml`) → open PR with
       the description above (commit: `chore(plugin-catalog): add background-review-watch
-      v0.5.0 entry (e673f95)`)
+      v0.5.0 entry (75c6f45)`)
 - [ ] Catalog CI needs maintainer "Approve and run" per head commit — batch
       pushes, never push WIP
 - [ ] After merge: note the listing URL in the README; update vault SOT
