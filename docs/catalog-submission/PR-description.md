@@ -156,15 +156,19 @@ What the pinned version contains, by file in the plugin repo:
 
 ## Internal pre-submit checklist (delete before submitting)
 
-- [ ] Re-run `hermes plugins validate` against a fresh clone at the pinned SHA
-      (not just the working tree) — cheap insurance
-- [ ] README at the pinned SHA renders acceptably (it's the catalog page)
+- [x] Re-run `hermes plugins validate` against a fresh clone at the pinned SHA
+      (not just the working tree) — done 2026-10-19: `Validation passed` at
+      `e673f95` on a clean local clone (expected warning: manifest-only plugin,
+      capability probe skipped)
+- [x] README at the pinned SHA renders acceptably (it's the catalog page) —
+      plain markdown + one table; reviewed at the pin
 - [ ] Fetch `PULL_REQUEST_TEMPLATE.md` from upstream main at paste time and
       mirror any section/checkbox drift (this draft tracks the 2026-10-14
       checkout; template verified identical on 2026-10-19)
 - [ ] Arthur approves the PR description wording
-- [ ] Push `unreleased` + `main` on vectorforge22/bg-review-watch first — the
-      pin and both raw.githubusercontent screenshot URLs are dead until then
+- [ ] Push `unreleased` + `main` + tags on vectorforge22/bg-review-watch first
+      (one command: `git push origin main unreleased v0.4.0 v0.4.1 v0.5.0`) —
+      the pin and both raw.githubusercontent screenshot URLs are dead until then
 - [ ] Fork NousResearch/hermes-agent → add `plugin-catalog/bg-review-watch.yaml`
       (bytes from `docs/catalog-submission/bg-review-watch.yaml`) → open PR with
       the description above (commit: `chore(plugin-catalog): add bg-review-watch
