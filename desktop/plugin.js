@@ -1,4 +1,4 @@
-// bg-review-watch — status chip + nudge countdown for Hermes background self-improvement runs,
+// background-review-watch — status chip + nudge countdown for Hermes background self-improvement runs,
 // plus compaction and foreground-completion guards for local-model workloads.
 //
 // Disk plugin (loaded uncompiled): only @hermes/plugin-sdk / react / react/jsx-runtime resolve.
@@ -93,9 +93,9 @@ const DEFAULT_COMPACT_STALE_MIN = 60
 const MIN_STALE_MIN = 1
 const MAX_STALE_MIN = 7 * 24 * 60 // a ceiling above one week is meaningless
 
-const SETTINGS_KEY = 'bg-review-watch.settings.v1'       // ctx.storage: { v, reviewStaleMin, compactStaleMin }
-const REVIEW_LAST_KEY = 'bg-review-watch.review-last.v1' // ctx.storage: last terminal review record
-const COMPACT_LAST_KEY = 'bg-review-watch.compact-last.v1' // ctx.storage key for the last terminal compaction
+const SETTINGS_KEY = 'background-review-watch.settings.v1'       // ctx.storage: { v, reviewStaleMin, compactStaleMin }
+const REVIEW_LAST_KEY = 'background-review-watch.review-last.v1' // ctx.storage: last terminal review record
+const COMPACT_LAST_KEY = 'background-review-watch.compact-last.v1' // ctx.storage key for the last terminal compaction
 
 // Log reads must not hang forever: a stalled reader used to freeze the poll state (the
 // 10-16/17 "compact stale · 30h+" incident — see header). An 8 s timeout turns a stall into
@@ -898,7 +898,7 @@ export { reconcileCompaction as __reconcileCompactionForTests }
 export { reconcile as __reconcileForTests }
 
 export default {
-  id: 'bg-review-watch',
+  id: 'background-review-watch',
   name: 'Background Review & Completion Watch',
   defaultEnabled: true,
   register(ctx) {

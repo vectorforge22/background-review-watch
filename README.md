@@ -85,10 +85,10 @@ automatic and re-derives everything from the live log.
 ## Install
 
 Disk plugin (no build step): copy `desktop/plugin.js` and `plugin.yaml` into
-`$HERMES_HOME/desktop-plugins/bg-review-watch/` — the app hot-reloads within
+`$HERMES_HOME/desktop-plugins/background-review-watch/` — the app hot-reloads within
 seconds. Enable in **Capabilities → Plugins** (on by default).
 
-Or via install link: `hermes://plugin/install?repo=<owner>/bg-review-watch&enable=1`
+Or via install link: `hermes://plugin/install?repo=<owner>/background-review-watch&enable=1`
 
 ## Cost
 

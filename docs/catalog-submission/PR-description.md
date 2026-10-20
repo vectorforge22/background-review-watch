@@ -1,10 +1,10 @@
-# PR description draft (INITIAL) — NousResearch/hermes-agent: plugin-catalog/bg-review-watch.yaml
+# PR description draft (INITIAL) — NousResearch/hermes-agent: plugin-catalog/background-review-watch.yaml
 
 > Draft, 2026-10-19. Paste everything below the line into the PR body.
-> Entry file: `plugin-catalog/bg-review-watch.yaml` (mirror kept in this repo at
-> `docs/catalog-submission/bg-review-watch.yaml`).
+> Entry file: `plugin-catalog/background-review-watch.yaml` (mirror kept in this repo at
+> `docs/catalog-submission/background-review-watch.yaml`).
 > **Owner submission**: the PR author (vectorforge22) owns the plugin repo.
-> Pin: `e673f95acf46a5c7026cba484accd4c7d6e9a79c` — vectorforge22/bg-review-watch
+> Pin: `e673f95acf46a5c7026cba484accd4c7d6e9a79c` — vectorforge22/background-review-watch
 > `unreleased` (v0.5.0). `hermes plugins validate` passes at that commit
 > (manifest OK, loadable `desktop/plugin.js`, **security scan safe**, no core
 > override, desktop surface inside the plugin SDK).
@@ -79,7 +79,7 @@ code.
 
 N/A — owner-initiated new catalog entry; no tracking issue exists. (Sibling
 plugin prompt-queue was added via [#131983](https://github.com/NousResearch/hermes-agent/pull/131983); the two form a logical pair — prompt-queue gates on
-review completion, bg-review-watch shows what that gate is waiting for.)
+review completion, background-review-watch shows what that gate is waiting for.)
 
 ## Type of Change
 
@@ -93,7 +93,7 @@ review completion, bg-review-watch shows what that gate is waiting for.)
 
 ## Changes Made
 
-- `plugin-catalog/bg-review-watch.yaml` — **the only file this PR changes**:
+- `plugin-catalog/background-review-watch.yaml` — **the only file this PR changes**:
   new entry, `tier: community`, `category: desktop`,
   `requires_hermes: ">=0.21.5"`, `version: "0.5.0"`, exact-SHA pin
   `e673f95acf46a5c7026cba484accd4c7d6e9a79c`, two sha-pinned screenshots,
@@ -107,7 +107,7 @@ What the pinned version contains, by file in the plugin repo:
 ## How to Test
 
 1. Clone at the pin:
-   `git clone https://github.com/vectorforge22/bg-review-watch && cd bg-review-watch && git checkout e673f95acf46a5c7026cba484accd4c7d6e9a79c`
+   `git clone https://github.com/vectorforge22/background-review-watch && cd background-review-watch && git checkout e673f95acf46a5c7026cba484accd4c7d6e9a79c`
 2. `node --experimental-vm-modules test-plugin.mjs` → passes: orphan spawn →
    stale → cleared by `review.summary`; always-on compaction chip with
    persisted last run; both render-time stale caps incl. custom ceilings;
@@ -117,7 +117,7 @@ What the pinned version contains, by file in the plugin repo:
 3. `hermes plugins validate <path-to-clone>` → `Validation passed` (security
    scan safe, no core override, desktop surface inside the plugin SDK).
 4. Optional live check: copy `desktop/plugin.js` + `plugin.yaml` to
-   `$HERMES_HOME/desktop-plugins/bg-review-watch/`; the chips appear within
+   `$HERMES_HOME/desktop-plugins/background-review-watch/`; the chips appear within
    seconds and track a real review/compaction cycle.
 
 ## Checklist
@@ -125,8 +125,8 @@ What the pinned version contains, by file in the plugin repo:
 ### Code
 
 - [x] I've read the [Contributing Guide](https://github.com/NousResearch/hermes-agent/blob/main/CONTRIBUTING.md)
-- [x] My commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (`fix(scope):`, `feat(scope):`, etc.) — single commit: `chore(plugin-catalog): add bg-review-watch v0.5.0 entry (e673f95)`
-- [x] I searched for [existing PRs](https://github.com/NousResearch/hermes-agent/pulls) to make sure this isn't a duplicate — no existing or open `bg-review-watch` entry; catalog audited 2026-10 (401 entries at upstream HEAD + live search); nearest neighbors (`agent-log`, `hermes-monitor`, `context-audit`) cover different surfaces
+- [x] My commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (`fix(scope):`, `feat(scope):`, etc.) — single commit: `chore(plugin-catalog): add background-review-watch v0.5.0 entry (e673f95)`
+- [x] I searched for [existing PRs](https://github.com/NousResearch/hermes-agent/pulls) to make sure this isn't a duplicate — no existing or open `background-review-watch` entry; catalog audited 2026-10 (401 entries at upstream HEAD + live search); nearest neighbors (`agent-log`, `hermes-monitor`, `context-audit`) cover different surfaces
 - [x] My PR contains **only** changes related to this fix/feature (no unrelated commits) — one catalog YAML file
 - [ ] I've run `pytest tests/ -q` and all tests pass — N/A: single-file catalog YAML, no Python touched; CI's gate remains authoritative
 - [ ] `python scripts/check` passes (the blocking lint and code-health checks CI runs) — N/A: same reason; catalog metadata is outside the lint surface
@@ -166,12 +166,12 @@ What the pinned version contains, by file in the plugin repo:
       mirror any section/checkbox drift (this draft tracks the 2026-10-14
       checkout; template verified identical on 2026-10-19)
 - [ ] Arthur approves the PR description wording
-- [ ] Push `unreleased` + `main` + tags on vectorforge22/bg-review-watch first
+- [ ] Push `unreleased` + `main` + tags on vectorforge22/background-review-watch first
       (one command: `git push origin main unreleased v0.4.0 v0.4.1 v0.5.0`) —
       the pin and both raw.githubusercontent screenshot URLs are dead until then
-- [ ] Fork NousResearch/hermes-agent → add `plugin-catalog/bg-review-watch.yaml`
-      (bytes from `docs/catalog-submission/bg-review-watch.yaml`) → open PR with
-      the description above (commit: `chore(plugin-catalog): add bg-review-watch
+- [ ] Fork NousResearch/hermes-agent → add `plugin-catalog/background-review-watch.yaml`
+      (bytes from `docs/catalog-submission/background-review-watch.yaml`) → open PR with
+      the description above (commit: `chore(plugin-catalog): add background-review-watch
       v0.5.0 entry (e673f95)`)
 - [ ] Catalog CI needs maintainer "Approve and run" per head commit — batch
       pushes, never push WIP

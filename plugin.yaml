@@ -1,4 +1,4 @@
-name: bg-review-watch
+name: background-review-watch
 version: 0.5.0
 description: "Status-bar chips for the background self-improvement review and batch context compaction: review running/done/stale with live elapsed time, a turn-countdown fill bar to the next nudge, an always-visible compaction chip (compacting/done/failed/stale with committed reduction or failure class), reply-guard recovery and review-overlap diagnostics, and a Settings page that tunes both orphan ceilings. Disclosure — renderer-only; polls filtered read-only tails of agent.log via host.logs (line windows 100–5000 per marker) to parse lifecycle markers, listens for review.summary/message.start/message.complete events, stores three small plugin-storage records (settings + last compaction + last review); no network calls beyond local gateway RPCs, no credential access, no self-update."
 author: "@vectorforge22"

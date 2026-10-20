@@ -1,4 +1,4 @@
-# Roadmap — bg-review-watch v0.6.0 (multi-session) + post-0.6 view modes
+# Roadmap — background-review-watch v0.6.0 (multi-session) + post-0.6 view modes
 
 Status: planned. v0.5.0 is the catalog entry (pin `e673f95`, initial PR pending).
 

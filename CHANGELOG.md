@@ -33,10 +33,10 @@ the first release to carry an explicit `VERSION` file.
 - **Configurable orphan ceilings** — Settings ▸ Plugins ▸ Thresholds:
   review-stale ceiling (default 240 min) and compaction-stale ceiling
   (default 60 min), in minutes, applied live without a reload. Persisted via
-  `ctx.storage` (`bg-review-watch.settings.v1`), sanitized (clamped to
+  `ctx.storage` (`background-review-watch.settings.v1`), sanitized (clamped to
   1 min – 7 days, defaults on junk), with a Reset row. Older hosts without
   `ctx.registerSettingsPage` skip the page and keep the built-in defaults.
-- **Persisted last review result** (`bg-review-watch.review-last.v1`): the
+- **Persisted last review result** (`background-review-watch.review-last.v1`): the
   completion tooltip now survives the log window rolling past, hot reloads,
   and app restarts — the same treatment v0.4.0 gave the compaction chip. The
   idle tooltip names when the last background review finished (and what it
@@ -45,6 +45,10 @@ the first release to carry an explicit `VERSION` file.
 
 ### Changed
 
+- **Renamed** plugin id and storage keys from `bg-review-watch` to
+  `background-review-watch` (repo rename, pre-publication — no version bump).
+  Records persisted under the old keys are orphaned but harmless: all state
+  re-derives from the live log on first poll.
 - Stale tooltips now name the active ceiling in minutes, so a configured
   value is visible where it acts.
 - Smoke test extended: review-side render cap with custom ceilings, settings
@@ -92,7 +96,7 @@ was observed — verify via `agent.log "context compression"`.
   Idle shows `compact idle · last <age>` with the last committed reduction
   (or failure class) in the tooltip; running/recent states are unchanged.
 - Persist the newest terminal compaction record (`ctx.storage`, key
-  `bg-review-watch.compact-last.v1`) so "last compacted" survives the 3000-line
+  `background-review-watch.compact-last.v1`) so "last compacted" survives the 3000-line
   log window rolling past, hot reloads (fresh module), and app restarts.
 - `ago()` now rolls hours into days past 48h (`1d 4h`), for long-lived idle labels.
 
@@ -144,8 +148,8 @@ was observed — verify via `agent.log "context compression"`.
 - Add the turn-based memory and skill nudge countdown bar.
 - Detect review lifecycle through live events and filtered `agent.log` polls.
 
-[0.5.0]: https://github.com/vectorforge22/bg-review-watch/compare/v0.4.1...v0.5.0
-[0.4.0]: https://github.com/vectorforge22/bg-review-watch/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/vectorforge22/bg-review-watch/compare/eb49f35...v0.3.0
-[0.2.0]: https://github.com/vectorforge22/bg-review-watch/compare/7a222e1...eb49f35
-[0.1.0]: https://github.com/vectorforge22/bg-review-watch/commit/7a222e12df8d2e71d2e9860df851753b967e5e28
+[0.5.0]: https://github.com/vectorforge22/background-review-watch/compare/v0.4.1...v0.5.0
+[0.4.0]: https://github.com/vectorforge22/background-review-watch/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/vectorforge22/background-review-watch/compare/eb49f35...v0.3.0
+[0.2.0]: https://github.com/vectorforge22/background-review-watch/compare/7a222e1...eb49f35
+[0.1.0]: https://github.com/vectorforge22/background-review-watch/commit/7a222e12df8d2e71d2e9860df851753b967e5e28

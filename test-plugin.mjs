@@ -71,7 +71,7 @@ const modules = new Map([
   })],
 ])
 
-const pluginModule = new vm.SourceTextModule(source, { identifier: 'bg-review-watch/desktop/plugin.js' })
+const pluginModule = new vm.SourceTextModule(source, { identifier: 'background-review-watch/desktop/plugin.js' })
 await pluginModule.link(specifier => {
   const linked = modules.get(specifier)
   assert.ok(linked, `unexpected import: ${specifier}`)
@@ -80,7 +80,7 @@ await pluginModule.link(specifier => {
 await pluginModule.evaluate()
 
 const plugin = pluginModule.namespace.default
-assert.equal(plugin.id, 'bg-review-watch')
+assert.equal(plugin.id, 'background-review-watch')
 assert.equal(plugin.defaultEnabled, true)
 // test-only named exports live on the namespace, not the default object
 const texp = pluginModule.namespace
@@ -141,7 +141,7 @@ eventHandlers.get('review.summary')({ text: 'Background review complete result=n
 await new Promise(resolve => setTimeout(resolve, 20))
 text = renderedText(chip)
 assert.ok(text.includes('review done'), `expected review done after summary event, got: ${text}`)
-const revRec = store['bg-review-watch.review-last.v1']
+const revRec = store['background-review-watch.review-last.v1']
 assert.ok(revRec && revRec.v === 1, 'review-last record persisted on the live event path')
 assert.equal(revRec.result, 'none', 'persisted result parsed from the summary text')
 assert.ok(String(revRec.summary).includes('Background review complete'), 'persisted summary carries the text')
@@ -225,4 +225,4 @@ assert.ok(text.includes('Last background review finished'), `idle tooltip carrie
 
 dispose()
 assert.equal(eventHandlers.size, 0)
-console.log(`bg-review-watch v${version} smoke test passed`)
+console.log(`background-review-watch v${version} smoke test passed`)
