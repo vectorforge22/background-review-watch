@@ -185,6 +185,28 @@ function trimSummary(t) {
   return s.length > 160 ? `${s.slice(0, 157)}…` : s
 }
 
+// ── Per-profile nudge countdowns ────────────────────────────────────────────────
+// Every gateway event is stamped with its source profile (GatewayEvent.profile — the
+// primary socket stamps it in use-gateway-boot, secondaries via stampSecondaryProfileOwner),
+// so a multi-profile window keeps ONE counter per profile instead of one shared value.
+// A shared counter leaked across profiles: every chip showed the same countdown and any
+// profile's review completion reset them all. reconcile() re-derives turns from the
+// ACTIVE profile's log (host.logs is profile-scoped), and the chips render the active
+// profile's entry via host.state.profile (mirrors the gateway route).
+const turnsByProfile = new Map() // normalized profile name -> turns since last review completion
+const profileKey = (p) => (p ?? '').trim() || 'default'
+const activeProfileKey = () => {
+  try {
+    return profileKey(host.state && host.state.profile && typeof host.state.profile.get === 'function' ? host.state.profile.get() : null)
+  } catch {
+    return 'default' // no profile atom on this host → single-profile fallback (old behavior)
+  }
+}
+const getTurns = (p) => turnsByProfile.get(profileKey(p)) ?? 0
+const setTurns = (p, n) => { turnsByProfile.set(profileKey(p), n) }
+const bumpTurns = (p) => { const k = profileKey(p); setTurns(k, getTurns(k) + 1) }
+const resetTurns = (p) => setTurns(p, 0)
+
 // ── plugin-global state (shared by the chips; module-scoped = survives chip re-mounts) ──
 let state = {
   mode: 'idle', // 'idle' | 'running' | 'stale' (orphaned spawn marker, slot free)
@@ -192,7 +214,6 @@ let state = {
   doneAt: null,
   doneResult: null,
   doneSummary: null,
-  turnsSince: 0,
   memInterval: 10,
   skillInterval: 15,
   lastPoll: 0,
@@ -245,9 +266,19 @@ async function hydrateSettings() {
   } catch { /* storage blip — defaults stand */ }
 }
 
-function persistSettings(rec) {
+// The storage bridge's set() is sync (returns void) in some app builds and a Promise in
+// others — never call .catch on it unconditionally (sync builds throw "Cannot read properties
+// of undefined (reading 'catch')", which used to kill the whole reconcile cycle after the
+// value was already written).
+function safeStorageSet(key, value) {
   if (!engineCtx || !engineCtx.storage) return
-  engineCtx.storage.set(SETTINGS_KEY, rec).catch(() => {})
+  let p
+  try { p = engineCtx.storage.set(key, value) } catch { return }
+  if (p && typeof p.catch === 'function') p.catch(() => {})
+}
+
+function persistSettings(rec) {
+  safeStorageSet(SETTINGS_KEY, rec)
 }
 
 // Sanitize + persist + apply. Called from the Settings page (user value) and hydrate (stored value).
@@ -266,8 +297,7 @@ async function hydrateLastCompact() {
 }
 
 function persistLastCompact(rec) {
-  if (!engineCtx || !engineCtx.storage) return
-  engineCtx.storage.set(COMPACT_LAST_KEY, rec).catch(() => {})
+  safeStorageSet(COMPACT_LAST_KEY, rec)
 }
 
 async function hydrateReviewLast() {
@@ -279,8 +309,7 @@ async function hydrateReviewLast() {
 }
 
 function persistReviewLast(rec) {
-  if (!engineCtx || !engineCtx.storage) return
-  engineCtx.storage.set(REVIEW_LAST_KEY, rec).catch(() => {})
+  safeStorageSet(REVIEW_LAST_KEY, rec)
 }
 
 function collectReviewMarkers(lines) {
@@ -376,8 +405,10 @@ async function reconcile() {
     const lines = (rev && (rev.lines || rev.data || rev.logs)) || []
     const { start, done, result } = collectReviewMarkers(lines)
 
-    // turns since the last completion (only needed when idle)
-    let turns = state.turnsSince
+    // turns since the last completion (only needed when idle) — this poll reads the
+    // ACTIVE profile's log, so the re-derived count belongs to that profile's counter.
+    const turnsProfile = activeProfileKey()
+    let turns = getTurns(turnsProfile)
     if (done != null) {
       const tr = await withTimeout(host.logs({ file: 'agent', lines: 5000, search: 'Turn ended' }), LOG_TIMEOUT_MS, 'agent.log poll (Turn ended)')
       const tlines = ((tr && (tr.lines || tr.data || tr.logs)) || []).map(lineText)
@@ -411,13 +442,13 @@ async function reconcile() {
       persistReviewLast(lastRec)
     }
 
+    // Only a genuinely running review holds the slot; stale/idle report the real countdown.
+    setTurns(turnsProfile, live && !stale ? 0 : turns)
     set({
       mode: stale ? 'stale' : live ? 'running' : 'idle',
       startedAt: live ? (state.startedAt || start) : null,
       doneAt: done,
       doneResult: done != null && result != null ? result : state.doneResult,
-      // Only a genuinely running review holds the slot; stale/idle report the real countdown.
-      turnsSince: live && !stale ? 0 : turns,
       reviewOverlapAt: overlap ? start : state.reviewOverlapAt,
       reviewLastRec: lastRec,
     })
@@ -531,12 +562,12 @@ function ensureWired() {
     reconcileCompaction()
     reconcileGuard()
     const offs = [
-      host.onEvent('message.start', () => {
-        set({
-          foregroundStartedAt: Date.now(),
-          foregroundCompletedAt: null,
-          ...(state.mode !== 'running' ? { turnsSince: state.turnsSince + 1 } : {}),
-        })
+      host.onEvent('message.start', (ev) => {
+        // Count the turn against the event's OWN profile (background profiles keep
+        // counting while another is foreground); a running review holds the slot, so
+        // no countdown advance while one is in flight.
+        if (state.mode !== 'running') bumpTurns((ev && ev.profile) || activeProfileKey())
+        set({ foregroundStartedAt: Date.now(), foregroundCompletedAt: null })
       }),
       host.onEvent('message.complete', () => {
         set({ foregroundCompletedAt: Date.now() })
@@ -548,17 +579,24 @@ function ensureWired() {
         // the log path in reconcile() keeps it on ties and never overwrites a newer one.
         const rec = { v: 1, endedAt: Date.now(), result: m ? m[1] : null, summary: text }
         persistReviewLast(rec)
+        // Restart only the completing profile's countdown; other profiles keep theirs.
+        resetTurns(ev && ev.profile)
         set({
           mode: 'idle',
           startedAt: null,
           doneAt: Date.now(),
           doneResult: m ? m[1] : null,
           doneSummary: text,
-          turnsSince: 0,
           reviewLastRec: rec,
         })
       }),
     ]
+    // Re-render the chips when the ACTIVE profile changes: each chip now renders the
+    // active profile's own state (its countdown; log-derived review/compaction already
+    // follows the active profile via host.logs). listen() returns the unsubscribe.
+    if (host.state && host.state.profile && typeof host.state.profile.listen === 'function') {
+      offs.push(host.state.profile.listen(() => set({})))
+    }
     // Self-rescheduling poll (v0.5.0): a bare setInterval kept ticking even when every
     // cycle died inside a hung log read, which is how the 10-16/17 frozen state happened.
     // This timer only ever schedules the NEXT tick after the current cycle settles (the
@@ -668,9 +706,12 @@ function FillBar({ frac, width = 44 }) {
 function Chip() {
   const s = useWatch()
   const now = useNow()
+  // This chip renders the ACTIVE profile's own countdown (host.state.profile mirrors the
+  // gateway route; the profile listener in ensureWired re-renders on a switch).
+  const turns = getTurns(activeProfileKey())
 
-  const memLeft = Math.max(0, s.memInterval - s.turnsSince)
-  const barFrac = s.turnsSince / s.memInterval
+  const memLeft = Math.max(0, s.memInterval - turns)
+  const barFrac = turns / s.memInterval
 
   // Render-time stale cap (v0.5.0): the twin of CompactionChip's backstop — the chip
   // re-renders every second via useNow, so even if reconcile's state is frozen at
@@ -699,10 +740,10 @@ function Chip() {
     label = `review done ${ago(now - s.doneAt)} ago`
     const summary = s.doneSummary || (rec && rec.summary) || ''
     detail = (summary || `Last background review finished (result: ${s.doneResult || 'none'}).`) +
-      `\nNext nudge in ${memLeft} turns — memory ${s.turnsSince}/${s.memInterval}, skill ${s.turnsSince}/${s.skillInterval}`
+      `\nNext nudge in ${memLeft} turns — memory ${turns}/${s.memInterval}, skill ${turns}/${s.skillInterval}`
   } else {
     label = 'review idle'
-    detail = `No background review running. Next nudge in ${memLeft} turns — memory ${s.turnsSince}/${s.memInterval}, skill ${s.turnsSince}/${s.skillInterval}` +
+    detail = `No background review running. Next nudge in ${memLeft} turns — memory ${turns}/${s.memInterval}, skill ${turns}/${s.skillInterval}` +
       (rec ? `\nLast background review finished ${ago(now - rec.endedAt)} ago (result: ${rec.result || 'none'})` +
         (rec.summary ? ` — ${trimSummary(rec.summary)}` : '') : '')
   }

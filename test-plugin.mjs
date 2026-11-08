@@ -31,8 +31,21 @@ const storage = {
   set: (k, v) => { store[k] = v; return Promise.resolve() },
 }
 
+// v0.5.1: fake of the desktop gateway's profile atom (host.state.profile). The
+// registry stamps every GatewayEvent with its source profile and mirrors the
+// active route in this atom; the plugin must keep one countdown per profile.
+let activeProfile = 'default'
+const profileListeners = new Set()
+const setProfile = (p) => { activeProfile = p; for (const cb of profileListeners) cb() }
+
 const eventHandlers = new Map()
 const host = {
+  state: {
+    profile: {
+      get: () => activeProfile,
+      listen: (cb) => { profileListeners.add(cb); return () => profileListeners.delete(cb) },
+    },
+  },
   logs: async ({ search }) => ({
     lines:
       search === 'bg-review' ? reviewLines
@@ -223,6 +236,53 @@ text = renderedText(chip)
 assert.ok(text.includes('review idle'), `expected plain idle after clean poll, got: ${text}`)
 assert.ok(text.includes('Last background review finished'), `idle tooltip carries the persisted last review: ${text}`)
 
+// 11. v0.5.1 multi-profile regression (the "4t on two profiles" leak): the nudge
+//     countdown must be kept PER PROFILE. Events carry their source profile
+//     (GatewayEvent.profile); the chip renders the ACTIVE profile's counter via
+//     host.state.profile, and a review.summary restarts only its own profile.
+eventHandlers.get('message.start')({ profile: 'default' }) // default: 1 turn
+eventHandlers.get('message.start')({ profile: 'alt' })     // alt: 3 turns
+eventHandlers.get('message.start')({ profile: 'alt' })
+eventHandlers.get('message.start')({ profile: 'alt' })
+text = renderedText(chip) // active = default → 9 left, memory 1/10
+assert.ok(text.includes('9t'), `default profile should show 9 turns left, got: ${text}`)
+assert.ok(text.includes('memory 1/10'), `default profile should show memory 1/10, got: ${text}`)
+setProfile('alt') // switch the active profile → atom listener re-renders
+text = renderedText(chip)
+assert.ok(text.includes('7t'), `alt profile should show 7 turns left, got: ${text}`)
+assert.ok(text.includes('memory 3/10'), `alt profile should show memory 3/10, got: ${text}`)
+eventHandlers.get('review.summary')({ profile: 'alt', text: 'Background review complete result=improved' })
+await new Promise(resolve => setTimeout(resolve, 20))
+text = renderedText(chip) // alt restarts from zero
+assert.ok(text.includes('10t'), `alt profile should reset to 10 turns, got: ${text}`)
+setProfile('default')
+text = renderedText(chip) // default keeps its own count
+assert.ok(text.includes('9t'), `default profile must keep 9 turns, got: ${text}`)
+assert.ok(text.includes('memory 1/10'), `default profile must keep memory 1/10, got: ${text}`)
+
+// 12. v0.5.2 sync storage bridge regression: the desktop app's createPluginStorage.set is
+//     SYNC (returns void) — v0.5.0/v0.5.1 called .catch on its return value, so every
+//     persist threw a TypeError AFTER the value was written. In reconcile that killed the
+//     cycle before set() — after a result=none review (no review.summary event) the chip
+//     froze on the stale record forever (the 2026-11-08 "memory 14/10, last 13h" incident).
+//     Discriminator: a fresh completion marker must refresh doneAt → the done-flash label
+//     reads ~1s; with the crash, set() never runs and the flash stays ≥10s old.
+const asyncSet = storage.set
+storage.set = (k, v) => { store[k] = v } // sync bridge: returns undefined, like the app
+await new Promise(resolve => setTimeout(resolve, 5100)) // clear the reconcile debounce
+// Fresh completion marker, newer than the persisted record from step 2. logTs is
+// evaluated here (after the sleep) so the marker's own timestamp is ~1s old at render.
+reviewLines = [`${logTs(1000)} INFO agent.background_review: Background review complete: thread=bg-review calls=6 in=209650 out=2255 cache_read=0 result=none`]
+await texp.__reconcileForTests()
+text = renderedText(chip)
+const flash = text.match(/review done (\d+)s ago/)
+assert.ok(flash, `expected a done-flash label after the fresh completion marker, got: ${text}`)
+assert.ok(Number(flash[1]) <= 2, `sync persist must not kill the cycle before set() — doneAt should be fresh, got: ${text}`)
+const synced = store['background-review-watch.review-last.v1']
+assert.ok(synced && synced.result === 'none', `record actually written through the sync bridge, got: ${JSON.stringify(synced)}`)
+storage.set = asyncSet
+
 dispose()
 assert.equal(eventHandlers.size, 0)
+assert.equal(profileListeners.size, 0, 'profile atom listener unsubscribed on dispose')
 console.log(`background-review-watch v${version} smoke test passed`)
